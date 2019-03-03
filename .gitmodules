@@ -1,0 +1,3 @@
+[submodule "includes/modules/payment/alma-php-client"]
+	path = includes/modules/payment/alma-php-client
+	url = git@github.com:alma/alma-php-client.git
