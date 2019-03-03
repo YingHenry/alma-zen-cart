@@ -1,9 +1,28 @@
 <?php
 
+require_once __DIR__ . '/alma-php-client/vendor/autoload.php';
+
+use Alma\API\RequestError;
+use Alma\API\Client;
+
 /**
  * Class of alma payment.
  */
 class alma {
+
+  /**
+   * Alma client.
+   *
+   * @var \Alma\API\Client
+   */
+  protected $alma;
+
+  /**
+   * Payment data.
+   *
+   * @var array
+   */
+  protected $paymentData;
 
   /**
    * Defines infos for admin dashboard, weight in payment choice and form
@@ -22,6 +41,47 @@ class alma {
     // Green light if sort_order is defined and enabled equals true.
     $this->enabled = MODULE_PAYMENT_ALMA_STATUS == 'True' ? TRUE : FALSE;
 
+    // Payment data.
+    if (!empty($order->info['total'])) {
+      $total = (int)($order->info['total'] * 100);
+    }
+    else {
+      $total = 0;
+    }
+
+    $this->paymentData = [
+      'payment' => [
+        'purchase_amount' => $total,
+        'return_url' => zen_href_link(FILENAME_CHECKOUT_PROCESS, '', 'SSL', TRUE, FALSE),
+        'shipping_address' => [
+          'line1' => !empty($order->delivery['street_address']) ? $order->delivery['street_address'] : '',
+          'city' => !empty($order->delivery['city']) ? $order->delivery['city'] : '',
+          'postal_code' => !empty($order->delivery['postcode']) ? $order->delivery['postcode'] : '',
+        ],
+      ],
+      'customer' => [
+        'first_name' => !empty($order->customer['firstname']) ? $order->customer['firstname'] : '',
+        'last_name' => !empty($order->customer['lastname']) ? $order->customer['lastname'] : '',
+        'email' => !empty($order->customer['email_address']) ? $order->customer['email_address'] : '',
+        'phone' => !empty($order->customer['telephone']) ? $order->customer['telephone'] : '',
+        'adresses' => [
+          [
+            'line1' => !empty($order->customer['street_address']) ? $order->customer['street_address'] : '',
+            'city' => !empty($order->customer['city']) ? $order->customer['city'] : '',
+            'postal_code' => !empty($order->customer['postcode']) ? $order->customer['postcode'] : '',
+          ],
+        ],
+      ],
+    ];
+
+    // Alma client.
+    if (defined('MODULE_PAYMENT_ALMA_API_KEY_TEST') && MODULE_PAYMENT_ALMA_API_KEY_TEST) {
+      $this->alma = new Client(trim(MODULE_PAYMENT_ALMA_API_KEY_TEST), ['mode' => Alma\API\TEST_MODE]);
+    }
+    else {
+      $this->enabled = FALSE;
+    }
+
     if (is_object($order)) {
       $this->update_status();
     }
@@ -31,21 +91,7 @@ class alma {
   }
 
   /**
-   * Builds process button.
-   *
-   * @return string
-   *   The process button.
-   */
-  public function process_button() {
-    // TODO: redirect to alma payment page.
-
-    $processButtonString = '';
-
-    return $processButtonString;
-  }
-
-  /**
-   * Disables payment if customer's zone is not in payment zone.
+   * Disables payment if customer's zone is not in payment zone in step 2.
    */
   public function update_status() {
     global $order, $db;
@@ -73,6 +119,59 @@ class alma {
         $this->enabled = FALSE;
       }
     }
+
+    $this->checkEligibility();
+  }
+
+  /**
+   * Checks eligibility of an order.
+   *
+   * @throws \Alma\API\RequestError
+   */
+  public function checkEligibility() {
+    if ($this->enabled) {
+      $eligibility = $this->alma->payments->eligibility($this->paymentData);
+
+      if (!$eligibility->isEligible) {
+        $this->enabled = FALSE;
+      }
+    }
+  }
+
+  /**
+   * Builds process button in step 3.
+   *
+   * @return string
+   *   The process button.
+   */
+  public function process_button() {
+    global $messageStack;
+
+    // Order is eligible, tries to create payment.
+    try {
+      $payment = $this->alma->payments->createPayment($this->paymentData);
+
+      // Redirects to alma payment page.
+      $processButtonString = '
+        <script type="text/javascript">
+          document.addEventListener("DOMContentLoaded", function() {
+            [].forEach.call(document.querySelectorAll("#btn_submit"), function(el) {
+              el.addEventListener("click", function(evt) {
+                location.href = "' . $payment->url . '";
+                evt.preventDefault(); // Prevents form submit.
+              })
+            })
+          });
+        </script>
+      ';
+    }
+    catch (RequestError $error) {
+      // Issue: redirect from step 3 is buggy. The page must be refreshed.
+      $messageStack->add_session('checkout_payment', 'Shipping adress or billing address is missing', 'error');
+      zen_redirect(zen_href_link(FILENAME_CHECKOUT_PAYMENT, '', 'SSL', TRUE, FALSE));
+    }
+
+    return $processButtonString;
   }
 
   public function javascript_validation() {
@@ -106,16 +205,52 @@ class alma {
    * Actions after the transaction.
    */
   public function before_process() {
-    global $messageStack;
+    global $messageStack, $order;
 
-    // TODO: Queries the server about the transaction.
-    $success = TRUE;
+    // Queries the server about the transaction.
+    $success = FALSE;
+
+    if (!empty($_GET['pid'])) {
+      // 404 if not found.
+      $pid = $_GET['pid'];
+
+      try {
+        $this->payment = $this->alma->payments->fetch($pid);
+        $state = $this->payment->state == 'in_progress' || $this->payment->state == 'paid';
+
+        // Data initialized in constructor are empty...
+        if (!empty($order->info['total'])) {
+          $total = (int)($order->info['total'] * 100);
+        }
+        else {
+          $total = 0;
+        }
+
+        $purchaseAmount = $this->payment->purchase_amount == $total;
+        $paymentPlanState = $this->payment->payment_plan[0]->state == 'paid';
+
+        if ($state &&
+          $purchaseAmount &&
+          $paymentPlanState
+        ) {
+          $success = TRUE;
+        }
+      }
+      catch (RequestError $error) {
+        foreach ($error->response->json['errors'] as $error) {
+          $messageStack->add_session('checkout_payment', $error['error_code'], 'error');
+        }
+      }
+    }
+    else {
+      $messageStack->add_session('checkout_payment', MODULE_PAYMENT_ALMA_NO_PID_ERROR, 'error');
+    }
 
     if ($success) {
       $this->order_status = 1;
     }
     else {
-      $messageStack->add_session('checkout_payment', MODULE_PAYMENT_ALMA_TEXT_ERROR, 'error');
+      // If payment failed redirect to payment choice page (step 2).
       zen_redirect(zen_href_link(FILENAME_CHECKOUT_PAYMENT, '', 'SSL', TRUE, FALSE));
     }
   }
@@ -126,12 +261,13 @@ class alma {
    * @return boolean
    */
   public function after_process() {
-    global $insert_id, $db, $order, $currencies;
+    global $insert_id, $db;
 
+    // Sets customer_notified to -1 so he cannot see it.
     $keys = "(comments, orders_id, orders_status_id, customer_notified, date_added)";
     $values = "(:comments, :orderID, :orderStatusId, -1, now())";
     $sql = "insert into " . TABLE_ORDERS_STATUS_HISTORY . " " . $keys . " values " . $values;
-    $comments = "My comment";
+    $comments = "ID: " . $this->payment->id;
     $sql = $db->bindVars( $sql, ':comments', $comments, 'string' );
     $sql = $db->bindVars( $sql, ':orderID', $insert_id, 'integer' );
     $sql = $db->bindVars( $sql, ':orderStatusId', $this->order_status, 'integer' );
@@ -150,7 +286,7 @@ class alma {
     global $HTTP_GET_VARS;
 
     $data = [
-      'title' => MODULE_PAYMENT_PAYGATEPAYWEB3_TEXT_ERROR,
+      'title' => MODULE_PAYMENT_ALMA_TEXT_ERROR,
       'error' => stripslashes(urldecode($HTTP_GET_VARS['error']))
     ];
 
@@ -179,13 +315,16 @@ class alma {
 
     $keys = "(configuration_title, configuration_key, configuration_value, configuration_description, configuration_group_id, sort_order, use_function, set_function, date_added)";
 
-    $values = "('Enable alma Module.', 'MODULE_PAYMENT_ALMA_STATUS', 'True', 'Do you want to accept PayPal payments?', '6', 0, '', 'zen_cfg_select_option(array(\'True\', \'False\'), ', now())";
+    $values = "('Enable alma Module.', 'MODULE_PAYMENT_ALMA_STATUS', 'True', 'Do you want to use alma?', '6', 0, '', 'zen_cfg_select_option(array(\'True\', \'False\'), ', now())";
     $db->Execute("insert into " . TABLE_CONFIGURATION . " " . $keys . "values" . $values);
 
-    $values = "('Sort order of display.', 'MODULE_PAYMENT_ALMA_SORT_ORDER', '0', 'Sort order of display. Lowest is displayed first.', '6', '0', '', '', now())";
+    $values = "('Sort order of display.', 'MODULE_PAYMENT_ALMA_SORT_ORDER', '0', 'Sort order of display. Lowest is on top.', '6', '0', '', '', now())";
     $db->Execute("insert into " . TABLE_CONFIGURATION . " " . $keys . "values" . $values);
 
     $values = "('Payment Zone', 'MODULE_PAYMENT_ALMA_ZONE', '0', 'If a zone is selected, only enable this payment method for that zone.', '6', '0', 'zen_get_zone_class_title', 'zen_cfg_pull_down_zone_classes(', now())";
+    $db->Execute("insert into " . TABLE_CONFIGURATION . " " . $keys . "values" . $values);
+
+    $values = "('API key', 'MODULE_PAYMENT_ALMA_API_KEY_TEST', '', 'You API key.', '6', '0', '', '', now())";
     $db->Execute("insert into " . TABLE_CONFIGURATION . " " . $keys . "values" . $values);
   }
 
@@ -209,6 +348,7 @@ class alma {
       'MODULE_PAYMENT_ALMA_STATUS',
       'MODULE_PAYMENT_ALMA_SORT_ORDER',
       'MODULE_PAYMENT_ALMA_ZONE',
+      'MODULE_PAYMENT_ALMA_API_KEY_TEST',
     ];
 
     return $keys;
